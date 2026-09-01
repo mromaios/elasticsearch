@@ -234,6 +234,62 @@ public class RecursiveChunkerTests extends ESTestCase {
         assertExpectedChunksGenerated(input, settings, expectedChunks);
     }
 
+    /**
+     * A large number of non-matching separators must not prevent the chunker from completing normally.
+     * With no separator matching, the input falls through to the backup sentence chunker.
+     */
+    public void testChunkWithManyNonMatchingSeparators() {
+        var separators = new ArrayList<String>();
+        addNonMatchingSeparators(separators, 50000);
+        RecursiveChunkingSettings settings = generateChunkingSettings(10, separators);
+        // Two sentences of ten words each, so the input exceeds the max chunk size and no separator can bring it back under.
+        String input = generateTestText(2, List.of(""));
+
+        // No separator matches, so the whole input falls through to the backup sentence chunker, which splits on the sentences.
+        assertExpectedChunksGenerated(
+            input,
+            settings,
+            List.of(new Chunker.ChunkOffset(0, TEST_SENTENCE.length()), new Chunker.ChunkOffset(TEST_SENTENCE.length(), input.length()))
+        );
+    }
+
+    /**
+     * Chunks must be returned in document order even when neighbouring chunks are resolved at very different separator
+     * depths. Here splitting on the newline leaves the first two sentences still over the max chunk size, so they descend
+     * through another hundred separators before splitting on the tab, while the trailing sentence is already small enough
+     * and is emitted as soon as it is reached.
+     */
+    public void testChunkOrderingIsPreservedWhenChunksResolveAtDifferentDepths() {
+        var separators = new ArrayList<String>();
+        addNonMatchingSeparators(separators, 100);
+        separators.add("\n");
+        addNonMatchingSeparators(separators, 100);
+        separators.add("\t");
+        addNonMatchingSeparators(separators, 100);
+
+        RecursiveChunkingSettings settings = generateChunkingSettings(10, separators);
+        String input = generateTestText(3, List.of("\t", "\n"));
+
+        var expectedFirstChunkOffsetEnd = TEST_SENTENCE.length();
+        var expectedSecondChunkOffsetEnd = TEST_SENTENCE.length() * 2 + "\t".length();
+        assertExpectedChunksGenerated(
+            input,
+            settings,
+            List.of(
+                new Chunker.ChunkOffset(0, expectedFirstChunkOffsetEnd),
+                new Chunker.ChunkOffset(expectedFirstChunkOffsetEnd, expectedSecondChunkOffsetEnd),
+                new Chunker.ChunkOffset(expectedSecondChunkOffsetEnd, input.length())
+            )
+        );
+    }
+
+    private void addNonMatchingSeparators(List<String> separators, int count) {
+        for (int i = 0; i < count; i++) {
+            // Indexed by the current size so that separators stay unique across repeated calls.
+            separators.add("NON_MATCHING_SEPARATOR_" + separators.size());
+        }
+    }
+
     private void assertExpectedChunksGenerated(String input, RecursiveChunkingSettings settings, List<Chunker.ChunkOffset> expectedChunks) {
         RecursiveChunker chunker = new RecursiveChunker();
         List<Chunker.ChunkOffset> chunks = chunker.chunk(input, settings);

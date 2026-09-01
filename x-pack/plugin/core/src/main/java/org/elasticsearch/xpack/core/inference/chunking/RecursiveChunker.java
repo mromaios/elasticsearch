@@ -12,6 +12,7 @@ import com.ibm.icu.text.BreakIterator;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.inference.ChunkingSettings;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -41,8 +42,7 @@ public class RecursiveChunker implements Chunker {
                 input,
                 new ChunkOffset(0, input.length()),
                 recursiveChunkingSettings.getSeparators(),
-                recursiveChunkingSettings.maxChunkSize(),
-                0
+                recursiveChunkingSettings.maxChunkSize()
             );
         } else {
             throw new IllegalArgumentException(
@@ -51,29 +51,48 @@ public class RecursiveChunker implements Chunker {
         }
     }
 
-    private List<ChunkOffset> chunk(String input, ChunkOffset offset, List<String> separators, int maxChunkSize, int separatorIndex) {
-        if (offset.start() == offset.end() || isChunkWithinMaxSize(buildChunkOffsetAndCount(input, offset), maxChunkSize)) {
-            return List.of(offset);
+    /**
+     * Splits {@code initialOffset} down until every emitted chunk is within {@code maxChunkSize}, advancing to the next
+     * separator each time a chunk is still too large.
+     * <p>
+     * The descent is driven by an explicit stack. Chunks are pushed in reverse so that they pop in document order,
+     * preserving the emission order of the recursive chunking strategy.
+     */
+    private List<ChunkOffset> chunk(String input, ChunkOffset initialOffset, List<String> separators, int maxChunkSize) {
+        if (initialOffset.start() == initialOffset.end()) {
+            return List.of(initialOffset);
         }
 
-        if (separatorIndex > separators.size() - 1) {
-            return chunkWithBackupChunker(input, offset, maxChunkSize);
-        }
+        // The word count for each pending chunk is carried alongside it, because splitting and merging already compute it.
+        var pendingChunks = new ArrayDeque<PendingChunk>();
+        pendingChunks.push(new PendingChunk(buildChunkOffsetAndCount(input, initialOffset), 0));
 
-        var potentialChunks = mergeChunkOffsetsUpToMaxChunkSize(
-            splitTextBySeparatorRegex(input, offset, separators.get(separatorIndex)),
-            maxChunkSize
-        );
-        var actualChunks = new ArrayList<ChunkOffset>();
-        for (var potentialChunk : potentialChunks) {
-            if (isChunkWithinMaxSize(potentialChunk, maxChunkSize)) {
-                actualChunks.add(potentialChunk.chunkOffset());
-            } else {
-                actualChunks.addAll(chunk(input, potentialChunk.chunkOffset(), separators, maxChunkSize, separatorIndex + 1));
+        var chunks = new ArrayList<ChunkOffset>();
+        while (pendingChunks.isEmpty() == false) {
+            var pendingChunk = pendingChunks.pop();
+            var chunkOffsetAndCount = pendingChunk.chunkOffsetAndCount();
+            var offset = chunkOffsetAndCount.chunkOffset();
+
+            if (offset.start() == offset.end() || isChunkWithinMaxSize(chunkOffsetAndCount, maxChunkSize)) {
+                chunks.add(offset);
+                continue;
+            }
+
+            if (pendingChunk.separatorIndex() > separators.size() - 1) {
+                chunks.addAll(chunkWithBackupChunker(input, offset, maxChunkSize));
+                continue;
+            }
+
+            var potentialChunks = mergeChunkOffsetsUpToMaxChunkSize(
+                splitTextBySeparatorRegex(input, offset, separators.get(pendingChunk.separatorIndex())),
+                maxChunkSize
+            );
+            for (int i = potentialChunks.size() - 1; i >= 0; i--) {
+                pendingChunks.push(new PendingChunk(potentialChunks.get(i), pendingChunk.separatorIndex() + 1));
             }
         }
 
-        return actualChunks;
+        return chunks;
     }
 
     private boolean isChunkWithinMaxSize(ChunkOffsetAndCount chunkOffsetAndCount, int maxChunkSize) {
@@ -147,4 +166,10 @@ public class RecursiveChunker implements Chunker {
     }
 
     private record ChunkOffsetAndCount(ChunkOffset chunkOffset, int wordCount) {}
+
+    /**
+     * A chunk that still needs to be checked against the max chunk size, together with the index of the separator to try
+     * next if it turns out to be too large.
+     */
+    private record PendingChunk(ChunkOffsetAndCount chunkOffsetAndCount, int separatorIndex) {}
 }
