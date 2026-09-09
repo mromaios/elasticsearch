@@ -42,16 +42,22 @@ import java.util.Optional;
 
 import static org.elasticsearch.compute.lucene.query.LuceneSliceQueue.PartitioningStrategy.DOC;
 import static org.elasticsearch.compute.lucene.query.LuceneSliceQueue.PartitioningStrategy.SEGMENT;
+import static org.elasticsearch.compute.lucene.query.LuceneSliceQueue.PartitioningStrategy.SHARD;
 import static org.hamcrest.Matchers.equalTo;
 
 /**
  * Tests {@link LuceneTopNSourceOperator#autoStrategy} / {@link LuceneTopNSourceOperator#pickStrategy}: a field-sorted
- * TopN goes to {@link LuceneSliceQueue.PartitioningStrategy#DOC} unless the sort can be short-circuited (sort by
- * {@code _score}, a points-indexed sort field, a sort congruent with the index sort, or a low-cost query), in which
- * case {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} is kept.
+ * TopN goes to {@link LuceneSliceQueue.PartitioningStrategy#DOC} unless the sort can be short-circuited (a
+ * points-indexed sort field, a sort congruent with the index sort, or a low-cost query), in which case
+ * {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} is kept.
  *
- * <p>Docs carry {@code kw} (keyword: postings + {@link SortedDocValuesField}, no points) and {@code num}
- * (long: points + doc values), so {@code kw} exercises the scan-dominant path and {@code num} the points path.
+ * <p>A {@code _score} sort instead picks between {@link LuceneSliceQueue.PartitioningStrategy#SHARD} and
+ * {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} by query cost — see {@link LuceneTopNSourceOperator#scoringStrategy}.
+ *
+ * <p>Docs carry {@code kw} (keyword: postings + {@link SortedDocValuesField}, no points, unique per doc), {@code num}
+ * (long: points + doc values) and {@code common} (keyword with the same value in every doc), so {@code kw} exercises
+ * the scan-dominant path and the cheap end of the cost gate, {@code num} the points path, and {@code common} the
+ * expensive end of the cost gate.
  */
 public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
 
@@ -83,6 +89,7 @@ public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
                 doc.add(new SortedDocValuesField("kw", new BytesRef(kw(i))));
                 doc.add(new LongPoint("num", i));
                 doc.add(new NumericDocValuesField("num", i));
+                doc.add(new StringField("common", "y", Field.Store.NO));
                 writer.addDocument(doc);
             }
         }
@@ -160,42 +167,79 @@ public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
         assertThat(pick(ctx, LongPoint.newRangeQuery("num", 5, 10), "kw", 1), equalTo(SEGMENT));
     }
 
-    // --- autoStrategy wrapper: _score and non-field sorts -> SEGMENT ---
-
-    public void testScoreSortPicksSegment() throws IOException {
-        ShardContext ctx = context(null, null);
-        // needsScore == true -> out of scope for DOC.
-        assertThat(auto(ctx, fieldSort("kw"), true, 1), equalTo(SEGMENT));
-    }
+    // --- autoStrategy wrapper: non-field sorts -> SEGMENT ---
 
     public void testNonFieldPrimarySortPicksSegment() throws IOException {
         ShardContext ctx = context(null, null);
-        assertThat(auto(ctx, List.of(new ScoreSortBuilder()), false, 1), equalTo(SEGMENT));
-        assertThat(auto(ctx, List.of(), false, 1), equalTo(SEGMENT));
+        assertThat(auto(ctx, List.of(new ScoreSortBuilder()), false, 1, Queries.ALL_DOCS_INSTANCE), equalTo(SEGMENT));
+        assertThat(auto(ctx, List.of(), false, 1, Queries.ALL_DOCS_INSTANCE), equalTo(SEGMENT));
     }
 
     public void testFieldSortThroughAutoStrategyPicksDoc() throws IOException {
         ShardContext ctx = context(null, null);
         // End-to-end through the public entry point: keyword sort, scan-dominant -> DOC.
-        assertThat(auto(ctx, fieldSort("kw"), false, 1), equalTo(DOC));
+        assertThat(auto(ctx, fieldSort("kw"), false, 1, Queries.ALL_DOCS_INSTANCE), equalTo(DOC));
+    }
+
+    // --- scoringStrategy: _score sorts are cost-gated between SHARD and SEGMENT, never DOC ---
+
+    public void testScoreSortMatchAllPicksShard() throws IOException {
+        ShardContext ctx = context(null, null);
+        // Every score is 1.0, so the TopN is arbitrary and fanning out buys nothing. Note the tiny threshold: this is
+        // decided before the cost gate.
+        assertThat(scoring(ctx, Queries.ALL_DOCS_INSTANCE, 1), equalTo(SHARD));
+    }
+
+    public void testScoreSortMatchNonePicksShard() throws IOException {
+        ShardContext ctx = context(null, null);
+        assertThat(scoring(ctx, Queries.NO_DOCS_INSTANCE, 1), equalTo(SHARD));
+    }
+
+    public void testScoreSortCostlyClausePicksSegment() throws IOException {
+        ShardContext ctx = context(null, null);
+        // A point range builds its scorer per segment either way, so SHARD would only serialise it. The huge threshold
+        // shows the costly-clause check wins over the cost gate.
+        assertThat(scoring(ctx, LongPoint.newRangeQuery("num", 5, 10), 1_000_000), equalTo(SEGMENT));
+    }
+
+    public void testScoreSortCheapQueryPicksShard() throws IOException {
+        ShardContext ctx = context(null, null);
+        // One matching doc out of NUM_DOCS: the SEGMENT fan-out costs more than the scan it parallelizes.
+        assertThat(scoring(ctx, new TermQuery(new Term("kw", kw(7))), NUM_DOCS / 2), equalTo(SHARD));
+    }
+
+    public void testScoreSortExpensiveQueryPicksSegment() throws IOException {
+        ShardContext ctx = context(null, null);
+        // "common" matches every doc, so the cost clears the threshold and the scoring scan is worth parallelizing.
+        assertThat(scoring(ctx, new TermQuery(new Term("common", "y")), NUM_DOCS / 2), equalTo(SEGMENT));
+    }
+
+    public void testScoreSortThroughAutoStrategyIgnoresTheSort() throws IOException {
+        ShardContext ctx = context(null, null);
+        // needsScore short-circuits the sort analysis: a points-indexed primary sort field would otherwise force
+        // SEGMENT, but a cheap scored query still goes to SHARD.
+        Query oneDoc = new TermQuery(new Term("kw", kw(7)));
+        assertThat(auto(ctx, fieldSort("num"), true, NUM_DOCS / 2, oneDoc), equalTo(SHARD));
+        assertThat(auto(ctx, List.of(new ScoreSortBuilder()), true, NUM_DOCS / 2, oneDoc), equalTo(SHARD));
     }
 
     private static LuceneSliceQueue.PartitioningStrategy pick(ShardContext ctx, Query query, String field, long minCostForDoc) {
         return LuceneTopNSourceOperator.pickStrategy(ctx, query, field, fieldSort(field), minCostForDoc);
     }
 
+    private static LuceneSliceQueue.PartitioningStrategy scoring(ShardContext ctx, Query query, long minCostForDoc) {
+        return LuceneTopNSourceOperator.scoringStrategy(ctx, query, minCostForDoc);
+    }
+
     private static LuceneSliceQueue.PartitioningStrategy auto(
         ShardContext ctx,
         List<SortBuilder<?>> sorts,
         boolean needsScore,
-        long minCostForDoc
+        long minCostForDoc,
+        Query query
     ) {
         return LuceneTopNSourceOperator.autoStrategy(sorts, needsScore, minCostForDoc)
             .pickStrategy(LuceneOperator.NO_LIMIT)
-            .apply(ctx, query());
-    }
-
-    private static Query query() {
-        return Queries.ALL_DOCS_INSTANCE;
+            .apply(ctx, query);
     }
 }

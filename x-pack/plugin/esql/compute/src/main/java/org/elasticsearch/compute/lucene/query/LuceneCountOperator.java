@@ -293,7 +293,8 @@ public class LuceneCountOperator extends LuceneOperator {
             q,
             LuceneSliceQueue.PartitioningStrategy.SHARD, // matchAll: the count is maxDoc, no scan needed
             minCostForDoc,
-            LuceneSliceQueue.PartitioningStrategy.SHARD  // cheap / empty
+            LuceneSliceQueue.PartitioningStrategy.SHARD, // cheap / empty
+            LuceneSliceQueue.PartitioningStrategy.DOC    // aboveThreshold: parallelize the scan-heavy count
         );
     }
 

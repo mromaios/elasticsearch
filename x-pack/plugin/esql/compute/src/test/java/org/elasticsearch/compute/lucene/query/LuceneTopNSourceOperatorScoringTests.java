@@ -107,6 +107,7 @@ public class LuceneTopNSourceOperatorScoringTests extends LuceneTopNSourceOperat
             queryFunction,
             dataPartitioning,
             LuceneSourceOperator.Factory::autoStrategy,
+            LuceneOperator.SMALL_INDEX_BOUNDARY,
             taskConcurrency,
             maxPageSize,
             limit,

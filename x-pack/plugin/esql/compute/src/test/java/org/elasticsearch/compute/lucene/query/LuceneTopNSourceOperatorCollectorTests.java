@@ -364,6 +364,7 @@ public class LuceneTopNSourceOperatorCollectorTests extends ComputeTestCase {
             queryFunction,
             partitioning,
             DataPartitioning.AutoStrategy.DEFAULT,
+            LuceneOperator.SMALL_INDEX_BOUNDARY,
             randomIntBetween(1, 10),
             10000,
             randomIntBetween(10, 100),

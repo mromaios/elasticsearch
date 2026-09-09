@@ -55,6 +55,17 @@ public class EsqlPartitioningIT extends ESRestTestCase {
         }
     }
 
+    /**
+     * The scored case that {@link #testDocsThresholdAbovePartitioning} flips. {@code common} is in every doc, so the
+     * query clears the cost gate and AUTO picks SEGMENT — which makes it the case where raising
+     * {@code esql.docs_threshold_auto_partitioning} above the shard's {@code maxDoc} visibly forces SHARD.
+     */
+    private static final Case EXPENSIVE_SCORED_CASE = new Case(
+        "| WHERE MATCH(t, \"common\") | SORT _score DESC | LIMIT 10",
+        "SEGMENT",
+        true
+    );
+
     @ParametersFactory(argumentFormatting = "[%1$s] %3$s -> %4$s")
     public static Iterable<Object[]> parameters() {
         List<Object[]> params = new ArrayList<>();
@@ -79,21 +90,30 @@ public class EsqlPartitioningIT extends ESRestTestCase {
                     new Case("| WHERE QSTR(\"a:1\")", "SHARD"),
                     new Case("| WHERE KQL(\"a:1\")", "SHARD"),
                     new Case("| WHERE a:\"1\"", "SHARD"),
-                    // TopN keeps SEGMENT under AUTO (sub-segment slicing breaks Lucene's sorted-segment
-                    // short-circuit; the scan-dominant TopN wins under DOC don't outweigh the sort-dominant
-                    // TopN losses). Users opt in to DOC via the data_partitioning pragma if needed.
+                    // A score-sorted TopN never picks DOC under AUTO: sub-segment slicing breaks Lucene's
+                    // sorted-segment short-circuit and the scored collector can't merge partial segments. Users
+                    // opt in to DOC via the data_partitioning pragma if needed. What AUTO does choose is SHARD vs
+                    // SEGMENT, by query cost. All of the cases below filter on `a`, a long field, so MATCH/QSTR/KQL
+                    // against it build point queries: costly to build a scorer for, hence SEGMENT no matter how many
+                    // docs they match.
                     new Case("| WHERE MATCH(a, \"2\") | SORT _score DESC", "SEGMENT", true),
                     new Case("| WHERE QSTR(\"a:2\") | SORT _score DESC", "SEGMENT", true),
                     new Case("| WHERE KQL(\"a:2\") | SORT _score DESC", "SEGMENT", true),
                     new Case("| WHERE MATCH(a, \"3\") | SORT _score DESC | LIMIT 10", "SEGMENT", true),
                     new Case("| WHERE MATCH(a, \"3\") OR MATCH(a, \"4\") | SORT _score DESC | LIMIT 10", "SEGMENT", true),
-                    new Case("| WHERE a:\"3\" | WHERE a:\"4\" | SORT _score DESC | LIMIT 10", "SEGMENT", true), }) {
+                    new Case("| WHERE a:\"3\" | WHERE a:\"4\" | SORT _score DESC | LIMIT 10", "SEGMENT", true),
+                    // `t` is a text field, so these build plain term queries and do reach the cost gate. `t2` is in
+                    // a tenth of the docs, below the 50,000-doc min_docs_per_slice boundary, so the SEGMENT fan-out
+                    // wouldn't be amortized -> SHARD. `common` is in all of them -> SEGMENT.
+                    new Case("| WHERE MATCH(t, \"t2\") | SORT _score DESC | LIMIT 10", "SHARD", true),
+                    EXPENSIVE_SCORED_CASE, }) {
                     params.add(
                         new Object[] {
                             defaultDataPartitioning,
                             index,
                             "FROM " + index + (c.score ? " METADATA _score " : " ") + c.suffix,
-                            expectedPartition(defaultDataPartitioning, index, c.idxPartition, c.score) }
+                            expectedPartition(defaultDataPartitioning, index, c.idxPartition, c.score),
+                            c }
                     );
                 }
             }
@@ -108,20 +128,24 @@ public class EsqlPartitioningIT extends ESRestTestCase {
     private final String index;
     private final String query;
     private final Matcher<String> expectedPartition;
+    private final Case testCase;
 
-    public EsqlPartitioningIT(String defaultDataPartitioning, String index, String query, Matcher<String> expectedPartition) {
+    public EsqlPartitioningIT(
+        String defaultDataPartitioning,
+        String index,
+        String query,
+        Matcher<String> expectedPartition,
+        Case testCase
+    ) {
         this.defaultDataPartitioning = defaultDataPartitioning;
         this.index = index;
         this.query = query;
         this.expectedPartition = expectedPartition;
+        this.testCase = testCase;
     }
 
     public void test() throws IOException {
-        setupIndex(index, switch (index) {
-            case "idx" -> IDX_DOCS;
-            case "small_idx" -> SMALL_IDX_DOCS;
-            default -> throw new IllegalArgumentException("unknown index [" + index + "]");
-        });
+        setupIndex();
         setDefaultDataPartitioning(defaultDataPartitioning);
         try {
             assertThat(partitionForQuery(query), expectedPartition);
@@ -130,11 +154,48 @@ public class EsqlPartitioningIT extends ESRestTestCase {
         }
     }
 
+    /**
+     * {@code esql.docs_threshold_auto_partitioning} is the kill switch for AUTO: shards with fewer docs than the
+     * threshold skip the strategy entirely and run on SHARD. Raising it above the shard's {@code maxDoc} therefore
+     * forces even the expensive scored query - the one case AUTO deliberately fans out over segments - back onto a
+     * single driver. Only meaningful for that one case on the large index under AUTO, so the rest of the matrix is
+     * skipped.
+     */
+    public void testDocsThresholdAbovePartitioning() throws IOException {
+        assumeTrue(
+            "only the expensive scored case on the large index picks SEGMENT under AUTO",
+            defaultDataPartitioning == null && "idx".equals(index) && EXPENSIVE_SCORED_CASE.equals(testCase)
+        );
+        setupIndex();
+        setDocsThresholdForAutoPartitioning(IDX_DOCS + 1);
+        try {
+            assertThat(partitionForQuery(query), equalTo("SHARD"));
+        } finally {
+            setDocsThresholdForAutoPartitioning(null);
+        }
+    }
+
+    private void setupIndex() throws IOException {
+        setupIndex(index, switch (index) {
+            case "idx" -> IDX_DOCS;
+            case "small_idx" -> SMALL_IDX_DOCS;
+            default -> throw new IllegalArgumentException("unknown index [" + index + "]");
+        });
+    }
+
     private void setDefaultDataPartitioning(String defaultDataPartitioning) throws IOException {
+        setTransientSetting("esql.default_data_partitioning", defaultDataPartitioning);
+    }
+
+    private void setDocsThresholdForAutoPartitioning(Integer docsThreshold) throws IOException {
+        setTransientSetting("esql.docs_threshold_auto_partitioning", docsThreshold);
+    }
+
+    private void setTransientSetting(String key, Object value) throws IOException {
         Request request = new Request("PUT", "/_cluster/settings");
         XContentBuilder builder = JsonXContent.contentBuilder().startObject();
         builder.startObject("transient");
-        builder.field("esql.default_data_partitioning", defaultDataPartitioning);
+        builder.field(key, value);
         builder.endObject();
         request.setJsonEntity(Strings.toString(builder.endObject()));
         int code = client().performRequest(request).getStatusLine().getStatusCode();
@@ -210,9 +271,16 @@ public class EsqlPartitioningIT extends ESRestTestCase {
                   "number_of_shards": 1,
                   "translog.flush_threshold_size": "1mb"
                 }
+              },
+              "mappings": {
+                "properties": {
+                  "t": { "type": "text" }
+                }
               }
             }""");  // Use a single shard to get consistent results. Low flush threshold to keep
-        // seenSequenceNumbers bounded in TranslogWriter when assertions are enabled.
+        // seenSequenceNumbers bounded in TranslogWriter when assertions are enabled. `t` is mapped explicitly so it
+        // stays a plain text field: it's the only field whose queries are cheap to build a scorer for, which is what
+        // lets the scored TopN cases reach the AUTO cost gate instead of stopping at the costly-clause check.
         client().performRequest(create);
         StringBuilder bulk = new StringBuilder();
         for (int d = 0; d < docs; d++) {
@@ -221,7 +289,11 @@ public class EsqlPartitioningIT extends ESRestTestCase {
             bulk.append(DateFieldMapper.DEFAULT_DATE_TIME_FORMATTER.formatMillis(BASE_TIME + d));
             bulk.append("\", \"a\": ");
             bulk.append(d % 10);
-            bulk.append("}\n");
+            // "common" lands in every doc and "t<n>" in a tenth of them, so the two terms sit on opposite sides of
+            // the AUTO cost gate.
+            bulk.append(", \"t\": \"common t");
+            bulk.append(d % 10);
+            bulk.append("\"}\n");
             if (bulk.length() > BULK_CHARS) {
                 logger.info("indexing {}: {}", index, d);
                 bulk(index, bulk.toString());

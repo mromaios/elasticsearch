@@ -214,7 +214,7 @@ public class LuceneSourceOperator extends LuceneOperator {
          */
         public static DataPartitioning.AutoStrategy autoStrategy(long minCostForDoc) {
             return limit -> limit == NO_LIMIT
-                ? (ctx, query) -> autoPartitioning(ctx, query, DOC, minCostForDoc, SEGMENT)
+                ? (ctx, query) -> autoPartitioning(ctx, query, DOC, minCostForDoc, SEGMENT, DOC)
                 : (ctx, query) -> limitedScanAutoStrategy(ctx, query, minCostForDoc);
         }
 
@@ -264,25 +264,29 @@ public class LuceneSourceOperator extends LuceneOperator {
         /**
          * Shared {@link DataPartitioning#AUTO} decision for the "cheap scorer, parallelize the scan" operators that visit
          * every matching doc: the no-limit unsorted source ({@code STATS}), the count ({@link LuceneCountOperator}) and
-         * the field-sorted TopN ({@link LuceneTopNSourceOperator}). They all protect against the same two things:
+         * both the field-sorted and the score-sorted TopN ({@link LuceneTopNSourceOperator}). They all protect against the
+         * same two things:
          * <ul>
          *     <li>a costly-to-build clause (point range, multi-term) whose full-segment scorer a sub-segment DOC slice
          *         would rebuild → {@link PartitioningStrategy#SEGMENT};</li>
-         *     <li>a query too cheap ({@code cost < minCostForDoc}) to amortize DOC's per-slice overhead → {@code cheap}.</li>
+         *     <li>a query too cheap ({@code cost < minCostForDoc}) to amortize the extra parallelism → {@code cheap}.</li>
          * </ul>
-         * Otherwise the scan is heavy enough to parallelize → {@link PartitioningStrategy#DOC}. The source's implicit-limit
+         * Otherwise the scan is heavy enough to parallelize → {@code aboveThreshold}. The source's implicit-limit
          * case is <em>not</em> routed here: it early-terminates after {@code N} matches, so the cost isn't the right signal.
          *
-         * @param matchAll outcome for a root {@link MatchAllDocsQuery}: SHARD when the match set needs no scan (count is
-         *                 {@code maxDoc}), DOC when it must be fully scanned (a field sort, or a no-limit scan)
-         * @param cheap    outcome below {@code minCostForDoc} (and for an empty {@link MatchNoDocsQuery})
+         * @param matchAll       outcome for a root {@link MatchAllDocsQuery}: SHARD when the match set needs no scan (count is
+         *                       {@code maxDoc}), DOC when it must be fully scanned (a field sort, or a no-limit scan)
+         * @param cheap          outcome below {@code minCostForDoc} (and for an empty {@link MatchNoDocsQuery})
+         * @param aboveThreshold outcome at or above {@code minCostForDoc}: DOC for the callers that can sub-slice a segment,
+         *                       SEGMENT for the score-sorted TopN, where DOC is out of scope
          */
         static PartitioningStrategy autoPartitioning(
             ShardContext ctx,
             Query query,
             PartitioningStrategy matchAll,
             long minCostForDoc,
-            PartitioningStrategy cheap
+            PartitioningStrategy cheap,
+            PartitioningStrategy aboveThreshold
         ) {
             Query unwrapped = unwrapQuery(query);
             if (unwrapped instanceof MatchAllDocsQuery) {
@@ -295,7 +299,7 @@ public class LuceneSourceOperator extends LuceneOperator {
                 return SEGMENT;
             }
             try {
-                return queryCost(ctx, query, minCostForDoc) < minCostForDoc ? cheap : DOC;
+                return queryCost(ctx, query, minCostForDoc) < minCostForDoc ? cheap : aboveThreshold;
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }

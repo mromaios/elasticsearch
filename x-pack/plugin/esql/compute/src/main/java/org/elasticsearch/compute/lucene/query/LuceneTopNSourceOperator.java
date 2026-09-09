@@ -63,11 +63,17 @@ import java.util.stream.Collectors;
 public final class LuceneTopNSourceOperator extends LuceneOperator {
 
     /**
-     * {@link DataPartitioning#AUTO} strategy for a field-sorted TopN. {@link LuceneSliceQueue.PartitioningStrategy#DOC}
-     * parallelizes a scan-dominant TopN across sub-segment slices, but for a sort that Lucene can short-circuit
-     * sub-segment slicing only adds overhead, so we keep {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} when:
+     * {@link DataPartitioning#AUTO} strategy for the TopN source. There are three shapes:
      * <ul>
-     *   <li>sorting by {@code _score} ({@code needsScore}) — out of scope for DOC for now;</li>
+     *   <li>sorting by {@code _score} ({@code needsScore}) — see {@link #scoringStrategy};</li>
+     *   <li>a field-sorted TopN — see {@link #pickStrategy};</li>
+     *   <li>anything else (no sort, or a primary sort we can't reason about) — {@code SEGMENT}, the safe middle
+     *       ground between {@code SHARD}'s serialisation and {@code DOC}'s per-slice overhead.</li>
+     * </ul>
+     * For the field-sorted TopN, {@link LuceneSliceQueue.PartitioningStrategy#DOC} parallelizes a scan-dominant TopN
+     * across sub-segment slices, but for a sort that Lucene can short-circuit sub-segment slicing only adds overhead,
+     * so we keep {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} when:
+     * <ul>
      *   <li>the primary sort field has a points index (numeric/date/ip): the sort prunes via the BKD tree,
      *       e.g. a data stream sorted by {@code @timestamp};</li>
      *   <li>the query sort is congruent with the index sort: Lucene early-terminates per segment;</li>
@@ -80,11 +86,51 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
      * is a full scan and DOC parallelizes it.
      */
     public static DataPartitioning.AutoStrategy autoStrategy(List<SortBuilder<?>> sorts, boolean needsScore, long minCostForDoc) {
-        if (needsScore || sorts.isEmpty() || sorts.get(0) instanceof FieldSortBuilder == false) {
+        if (needsScore) {
+            return unusedLimit -> (ctx, query) -> scoringStrategy(ctx, query, minCostForDoc);
+        }
+        if (sorts.isEmpty() || sorts.get(0) instanceof FieldSortBuilder == false) {
             return unusedLimit -> (ctx, query) -> LuceneSliceQueue.PartitioningStrategy.SEGMENT;
         }
         String primarySortField = ((FieldSortBuilder) sorts.get(0)).getFieldName();
         return unusedLimit -> (ctx, query) -> pickStrategy(ctx, query, primarySortField, sorts, minCostForDoc);
+    }
+
+    /**
+     * {@link DataPartitioning#AUTO} decision for a {@code _score}-sorted TopN, i.e. the search use case. This picks
+     * between {@link LuceneSliceQueue.PartitioningStrategy#SHARD} and {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT}
+     * only — {@link LuceneSliceQueue.PartitioningStrategy#DOC} is out of scope for {@code _score} for now, because the
+     * collector would have to be able to merge partial-segment scored TopNs.
+     * <p>
+     * {@code SEGMENT} is the right default for an expensive query: fanning the scoring scan out over the segments is
+     * where the tail-latency and throughput win comes from. But it costs one driver per slice, and on a cheap query
+     * that fan-out (task scheduling, {@code esql_worker} queueing, the per-driver TopN merge) is pure overhead that
+     * raises the latency floor. So gate it on the query's cost, exactly as the unsorted source and the count do:
+     * <ul>
+     *   <li>{@link org.apache.lucene.search.MatchAllDocsQuery} → {@code SHARD}: every score is 1.0, so the TopN is
+     *       arbitrary and parallelism buys nothing;</li>
+     *   <li>{@link org.apache.lucene.search.MatchNoDocsQuery} → {@code SHARD}: there is nothing to do;</li>
+     *   <li>a costly-to-build clause (BKD point range, multi-term) → {@code SEGMENT}: the scorer is built per segment
+     *       either way, so {@code SHARD} would only serialise it;</li>
+     *   <li>{@code cost < minCostForDoc} → {@code SHARD}: the fan-out isn't amortised;</li>
+     *   <li>otherwise → {@code SEGMENT}.</li>
+     * </ul>
+     *
+     * @param minCostForDoc the cost boundary. The name is inherited from the callers that use it to gate {@code DOC};
+     *                      here it gates {@code SEGMENT}. It comes from the {@code min_docs_per_slice} pragma, i.e. a
+     *                      slice-sizing constant reused as a query-cost boundary, so treat it as a starting point
+     *                      rather than a tuned value.
+     */
+    // Visible for testing.
+    static LuceneSliceQueue.PartitioningStrategy scoringStrategy(ShardContext ctx, Query query, long minCostForDoc) {
+        return LuceneSourceOperator.Factory.autoPartitioning(
+            ctx,
+            query,
+            LuceneSliceQueue.PartitioningStrategy.SHARD, // matchAll: every score is 1.0, the TopN is arbitrary
+            minCostForDoc,
+            LuceneSliceQueue.PartitioningStrategy.SHARD, // cheap / empty
+            LuceneSliceQueue.PartitioningStrategy.SEGMENT // aboveThreshold: DOC is out of scope for _score
+        );
     }
 
     // Visible for testing.
@@ -122,7 +168,8 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
                 query,
                 LuceneSliceQueue.PartitioningStrategy.DOC, // matchAll: a field sort must scan every doc
                 minCostForDoc,
-                LuceneSliceQueue.PartitioningStrategy.SEGMENT // cheap / empty
+                LuceneSliceQueue.PartitioningStrategy.SEGMENT, // cheap / empty
+                LuceneSliceQueue.PartitioningStrategy.DOC // aboveThreshold: parallelize the full scan
             );
         } catch (IOException e) {
             throw new UncheckedIOException(e);
@@ -136,11 +183,21 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
         private final long estimatedPerRowSortSize;
         final PerShardCollectorProvider perShardCollectorProvider;
 
+        /**
+         * @param docThresholdForAutoStrategy under {@link DataPartitioning#AUTO}, shards with fewer docs than this
+         *                                    skip {@code autoStrategy} entirely and use
+         *                                    {@link LuceneSliceQueue.PartitioningStrategy#SHARD}. Taken from the
+         *                                    caller (rather than pinned to {@link LuceneOperator#SMALL_INDEX_BOUNDARY})
+         *                                    so the {@code esql.docs_threshold_auto_partitioning} setting reaches the
+         *                                    TopN path too: raising it past a shard's {@code maxDoc} is the kill
+         *                                    switch that forces the whole sorted/scored path back to {@code SHARD}.
+         */
         public Factory(
             IndexedByShardId<? extends ShardContext> contexts,
             Function<ShardContext, List<LuceneSliceQueue.QueryAndTags>> queryFunction,
             DataPartitioning dataPartitioning,
             DataPartitioning.AutoStrategy autoStrategy,
+            int docThresholdForAutoStrategy,
             int taskConcurrency,
             int maxPageSize,
             int limit,
@@ -155,7 +212,7 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
                 queryFunction,
                 dataPartitioning,
                 autoStrategy.pickStrategy(limit),
-                LuceneOperator.SMALL_INDEX_BOUNDARY,
+                docThresholdForAutoStrategy,
                 taskConcurrency,
                 limit,
                 needsScore,

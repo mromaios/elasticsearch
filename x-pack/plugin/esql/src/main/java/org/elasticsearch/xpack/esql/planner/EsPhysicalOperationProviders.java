@@ -647,6 +647,7 @@ public class EsPhysicalOperationProviders extends AbstractPhysicalOperationProvi
                     scoring,
                     context.queryPragmas().minDocsPerSlice(LuceneSliceQueue.MIN_DOCS_PER_SLICE)
                 ),
+                context.queryPragmas().docsThresholdForAutoPartitioning(plannerSettings.docsThresholdForAutoPartitioning()),
                 taskConcurrency,
                 context.pageSize(esQueryExec, rowEstimatedSize),
                 limit,
