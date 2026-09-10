@@ -112,6 +112,8 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
      *   <li>{@link org.apache.lucene.search.MatchNoDocsQuery} → {@code SHARD}: there is nothing to do;</li>
      *   <li>a costly-to-build clause (BKD point range, multi-term) → {@code SEGMENT}: the scorer is built per segment
      *       either way, so {@code SHARD} would only serialise it;</li>
+     *   <li>a positional clause (a phrase) → {@code SEGMENT}: its cost understates its work, so the gate below
+     *       can't be trusted for it. See {@link LuceneSourceOperator.Factory#isPositionalQuery};</li>
      *   <li>{@code cost < minCostForDoc} → {@code SHARD}: the fan-out isn't amortised;</li>
      *   <li>otherwise → {@code SEGMENT}.</li>
      * </ul>
@@ -123,6 +125,12 @@ public final class LuceneTopNSourceOperator extends LuceneOperator {
      */
     // Visible for testing.
     static LuceneSliceQueue.PartitioningStrategy scoringStrategy(ShardContext ctx, Query query, long minCostForDoc) {
+        // Checked ahead of the cost gate, and separately from the costly-to-build check inside autoPartitioning:
+        // that one is shared with the operators that use it to gate DOC, where a phrase query is a legitimate
+        // candidate for sub-segment slicing and shouldn't be pushed back to SEGMENT.
+        if (LuceneSourceOperator.Factory.containsPositionalClause(query)) {
+            return LuceneSliceQueue.PartitioningStrategy.SEGMENT;
+        }
         return LuceneSourceOperator.Factory.autoPartitioning(
             ctx,
             query,

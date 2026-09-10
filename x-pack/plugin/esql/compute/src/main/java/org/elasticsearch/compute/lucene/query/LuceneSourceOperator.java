@@ -17,7 +17,9 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
+import org.apache.lucene.search.MultiPhraseQuery;
 import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.PointInSetQuery;
 import org.apache.lucene.search.PointRangeQuery;
 import org.apache.lucene.search.Query;
@@ -53,6 +55,7 @@ import java.util.List;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static org.apache.lucene.search.ScoreMode.COMPLETE;
@@ -336,32 +339,52 @@ public class LuceneSourceOperator extends LuceneOperator {
          * walk via {@link Query#visit}.
          */
         static boolean containsCostlyClause(Query query) {
+            return containsClause(query, Factory::isCostlyToBuildScorer);
+        }
+
+        /**
+         * Walk the full query tree and return {@code true} if any sub-query is positional, i.e. one whose
+         * {@link #queryCost} is a poor proxy for the work it does. See {@link #isPositionalQuery}.
+         */
+        static boolean containsPositionalClause(Query query) {
+            return containsClause(query, Factory::isPositionalQuery);
+        }
+
+        /**
+         * Walk the full query tree and return {@code true} if {@code predicate} accepts any sub-query. Every
+         * {@link QueryVisitor} callback that can be handed a query is checked, because Lucene reports a leaf through
+         * different ones depending on its shape: a {@link org.apache.lucene.search.TermQuery} through
+         * {@code consumeTerms}, a {@link MultiTermQuery} through {@code consumeTermsMatching}, a
+         * {@link PointRangeQuery} through {@code visitLeaf}, and a compound query such as
+         * {@link org.apache.lucene.search.PhraseQuery} only as the {@code parent} of a sub-visitor.
+         */
+        private static boolean containsClause(Query query, Predicate<Query> predicate) {
             boolean[] found = { false };
             query.visit(new QueryVisitor() {
                 @Override
                 public void consumeTerms(Query q, Term... terms) {
-                    if (isCostlyToBuildScorer(q)) {
+                    if (predicate.test(q)) {
                         found[0] = true;
                     }
                 }
 
                 @Override
                 public void consumeTermsMatching(Query q, String field, Supplier<ByteRunAutomaton> automaton) {
-                    if (isCostlyToBuildScorer(q)) {
+                    if (predicate.test(q)) {
                         found[0] = true;
                     }
                 }
 
                 @Override
                 public void visitLeaf(Query q) {
-                    if (isCostlyToBuildScorer(q)) {
+                    if (predicate.test(q)) {
                         found[0] = true;
                     }
                 }
 
                 @Override
                 public QueryVisitor getSubVisitor(BooleanClause.Occur occur, Query parent) {
-                    if (isCostlyToBuildScorer(parent)) {
+                    if (predicate.test(parent)) {
                         found[0] = true;
                     }
                     // Visit every branch including MUST_NOT — a costly negated clause still has to be
@@ -370,6 +393,36 @@ public class LuceneSourceOperator extends LuceneOperator {
                 }
             });
             return found[0];
+        }
+
+        /**
+         * Is {@code query} positional, i.e. does it verify a per-document constraint that its
+         * {@link org.apache.lucene.search.ScorerSupplier#cost()} does not account for?
+         * <p>
+         * {@link #queryCost} counts <em>candidate</em> documents, which is a good proxy for the work a term query
+         * does — advance the postings, score, move on. It is a bad proxy for a phrase or interval query: those report
+         * the cost of their rarest term (the clauses are a conjunction, so that bounds the candidates) but then have
+         * to decode and intersect positions for every one of those candidates, several times more work per document
+         * than a term query. {@link org.apache.lucene.search.PhraseQuery PhraseQuery} over a field whose rarest term
+         * hits 40k docs reports a cost of 40k, the same as a {@code TermQuery} matching 40k docs, while doing far
+         * more work. The extreme case is {@code SourceConfirmedTextQuery} ({@code match_only_text}), which re-reads
+         * and re-analyzes {@code _source} per candidate.
+         * <p>
+         * Lucene's span and interval queries belong here too, but they live in {@code lucene-queries}, which this
+         * module doesn't read, and no ES|QL function builds one: {@code MATCH_PHRASE}, {@code QSTR} and {@code KQL}
+         * all produce {@link PhraseQuery} or {@link MultiPhraseQuery}. Add {@code requires
+         * org.apache.lucene.queries} and the two types here if that changes.
+         * <p>
+         * So these queries must not be routed by cost alone: for them the cost gate reads "cheap" on queries that
+         * are anything but, and the fan-out it would skip is exactly what keeps their tail latency down.
+         */
+        static boolean isPositionalQuery(Query query) {
+            if (query instanceof PhraseQuery || query instanceof MultiPhraseQuery) {
+                return true;
+            }
+            // Lives in the mapper-extras module, which isn't on this classpath — match on the name, as the
+            // costly-to-build check above does for Lucene's package-private multi-term wrappers.
+            return query.getClass().getSimpleName().equals("SourceConfirmedTextQuery");
         }
 
         // copied from UsageTrackingQueryCachingPolicy

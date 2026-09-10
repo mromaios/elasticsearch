@@ -13,11 +13,15 @@ import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
@@ -55,9 +59,10 @@ import static org.hamcrest.Matchers.equalTo;
  * {@link LuceneSliceQueue.PartitioningStrategy#SEGMENT} by query cost — see {@link LuceneTopNSourceOperator#scoringStrategy}.
  *
  * <p>Docs carry {@code kw} (keyword: postings + {@link SortedDocValuesField}, no points, unique per doc), {@code num}
- * (long: points + doc values) and {@code common} (keyword with the same value in every doc), so {@code kw} exercises
- * the scan-dominant path and the cheap end of the cost gate, {@code num} the points path, and {@code common} the
- * expensive end of the cost gate.
+ * (long: points + doc values), {@code common} (keyword with the same value in every doc) and {@code t}/{@code t2}
+ * (analyzed text, so they carry positions). {@code kw} exercises the scan-dominant path and the cheap end of the cost
+ * gate, {@code num} the points path, {@code common} the expensive end of the cost gate, and {@code t}/{@code t2} the
+ * positional queries whose cost understates their work.
  */
 public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
 
@@ -90,6 +95,11 @@ public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
                 doc.add(new LongPoint("num", i));
                 doc.add(new NumericDocValuesField("num", i));
                 doc.add(new StringField("common", "y", Field.Store.NO));
+                // Analyzed, so they carry positions: "common" is in every doc, "rare" in a fifth of them, so
+                // the phrase "rare common" costs only what "rare" costs.
+                String text = i % 5 == 0 ? "rare common" : "filler common";
+                doc.add(new TextField("t", text, Field.Store.NO));
+                doc.add(new TextField("t2", text, Field.Store.NO));
                 writer.addDocument(doc);
             }
         }
@@ -214,6 +224,39 @@ public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
         assertThat(scoring(ctx, new TermQuery(new Term("common", "y")), NUM_DOCS / 2), equalTo(SEGMENT));
     }
 
+    public void testScoreSortPhraseQueryPicksSegment() throws IOException {
+        ShardContext ctx = context(null, null);
+        // A phrase is a conjunction, so its cost is that of its rarest term — here "rare", in a fifth of the docs,
+        // which is below the threshold and would read as cheap. But verifying the phrase decodes and intersects
+        // positions for each of those candidates, so this is not a query to run on a single driver.
+        Query phrase = new PhraseQuery("t", "rare", "common");
+        assertThat(scoring(ctx, phrase, NUM_DOCS), equalTo(SEGMENT));
+        // The equivalent disjunction sums its terms' costs instead, so the gate already sends it to SEGMENT. The
+        // point of the assertion above is that the phrase agrees, rather than reading as cheap and going to SHARD.
+        Query disjunction = new BooleanQuery.Builder().add(new TermQuery(new Term("t", "rare")), BooleanClause.Occur.SHOULD)
+            .add(new TermQuery(new Term("t", "common")), BooleanClause.Occur.SHOULD)
+            .build();
+        assertThat(scoring(ctx, disjunction, NUM_DOCS), equalTo(SEGMENT));
+    }
+
+    public void testScoreSortNestedPhraseQueryPicksSegment() throws IOException {
+        ShardContext ctx = context(null, null);
+        // `MATCH_PHRASE(a, "...") OR MATCH_PHRASE(b, "...")` — the shape the full-text benchmark runs. The phrases
+        // are nested inside a BooleanQuery, so the check has to walk the tree rather than test the root.
+        Query nested = new BooleanQuery.Builder().add(new PhraseQuery("t", "rare", "common"), BooleanClause.Occur.SHOULD)
+            .add(new PhraseQuery("t2", "rare", "common"), BooleanClause.Occur.SHOULD)
+            .build();
+        assertThat(scoring(ctx, nested, NUM_DOCS), equalTo(SEGMENT));
+    }
+
+    public void testScoreSortSingleTermPhraseQueryPicksShard() throws IOException {
+        ShardContext ctx = context(null, null);
+        // Lucene rewrites a one-term phrase to a TermQuery, which has no positions to verify. It really is cheap,
+        // so it should still reach SHARD — the positional check must not swallow the whole optimisation.
+        Query onePosition = new PhraseQuery("t", "rare");
+        assertThat(scoring(ctx, onePosition, NUM_DOCS), equalTo(SHARD));
+    }
+
     public void testScoreSortThroughAutoStrategyIgnoresTheSort() throws IOException {
         ShardContext ctx = context(null, null);
         // needsScore short-circuits the sort analysis: a points-indexed primary sort field would otherwise force
@@ -227,8 +270,9 @@ public class LuceneTopNSourceOperatorAutoStrategyTests extends ESTestCase {
         return LuceneTopNSourceOperator.pickStrategy(ctx, query, field, fieldSort(field), minCostForDoc);
     }
 
-    private static LuceneSliceQueue.PartitioningStrategy scoring(ShardContext ctx, Query query, long minCostForDoc) {
-        return LuceneTopNSourceOperator.scoringStrategy(ctx, query, minCostForDoc);
+    /** Rewrites first, as {@link LuceneSliceQueue} does before it picks, so {@code queryCost}'s assertion holds. */
+    private static LuceneSliceQueue.PartitioningStrategy scoring(ShardContext ctx, Query query, long minCostForDoc) throws IOException {
+        return LuceneTopNSourceOperator.scoringStrategy(ctx, ctx.searcher().rewrite(query), minCostForDoc);
     }
 
     private static LuceneSliceQueue.PartitioningStrategy auto(

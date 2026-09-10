@@ -106,6 +106,11 @@ public class EsqlPartitioningIT extends ESRestTestCase {
                     // a tenth of the docs, below the 50,000-doc min_docs_per_slice boundary, so the SEGMENT fan-out
                     // wouldn't be amortized -> SHARD. `common` is in all of them -> SEGMENT.
                     new Case("| WHERE MATCH(t, \"t2\") | SORT _score DESC | LIMIT 10", "SHARD", true),
+                    // A phrase is a conjunction, so its cost is that of its rarest term: `t2`, in a tenth of the
+                    // docs, which is below the boundary the MATCH case above lands under. Going by cost alone this
+                    // would read as cheap and pick SHARD, but verifying a phrase decodes and intersects positions
+                    // for every one of those candidates, so it stays on SEGMENT.
+                    new Case("| WHERE MATCH_PHRASE(t, \"common t2\") | SORT _score DESC | LIMIT 10", "SEGMENT", true),
                     EXPENSIVE_SCORED_CASE, }) {
                     params.add(
                         new Object[] {
