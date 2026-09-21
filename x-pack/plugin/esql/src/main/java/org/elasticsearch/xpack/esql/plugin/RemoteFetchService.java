@@ -463,6 +463,9 @@ public final class RemoteFetchService {
                 maxWorkers,
                 () -> node
             );
+            if (configuration.profile()) {
+                client.enableProfiling();
+            }
             retainedSessionReleaser.track(node, target.retainedSessionId());
             return new TargetExchangeChannel(target, node, retainedSessionReleaser, client, fields, pushdownPlan, configuration);
         }
